@@ -1,0 +1,16 @@
+# environments & secrets
+.venv/
+.env
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+# generated data, models, results (re-created by the pipeline)
+data/raw/*
+data/processed/*
+data/processed_smoke/
+models/*
+results/*
+!**/.gitkeep
+# packaging
+*.zip
