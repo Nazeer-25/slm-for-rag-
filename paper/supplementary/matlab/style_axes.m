@@ -1,0 +1,6 @@
+function style_axes(ax)
+%STYLE_AXES  Quiet axes: small sans-serif text, grey ink, no box.
+set(ax, 'FontName', 'Arial', 'FontSize', 7.5, 'Box', 'off', 'TickDir', 'out', ...
+    'XColor', [82 81 78] / 255, 'YColor', [82 81 78] / 255, 'LineWidth', 0.6, ...
+    'Color', 'w');
+end
