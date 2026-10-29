@@ -1,0 +1,161 @@
+{
+  "params": {
+    "distilbert_total": 66955010,
+    "distilbert_trainable": 7680002,
+    "trainable_share": 0.11470391834755905,
+    "distilbert_block": 7087872,
+    "distilbert_head": 592130,
+    "minilm_total": 22713216,
+    "llama32_3b_total_reported": 3210000000.0
+  },
+  "training": {
+    "pool": 70000,
+    "sample": 6000,
+    "sample_share": 0.08571428571428572,
+    "batch": 16,
+    "epochs_run": 3,
+    "selected_epoch": 1,
+    "threshold": 0.175,
+    "steps_per_epoch": 375
+  },
+  "regular": {
+    "counts": {
+      "TN": 5000,
+      "FP": 0,
+      "FN": 0,
+      "TP": 5000,
+      "N": 10000
+    },
+    "accuracy": 1.0,
+    "accuracy_ci": [
+      0.9996160016293234,
+      1.0
+    ],
+    "precision": 1.0,
+    "precision_ci": [
+      0.9992322980549431,
+      1.0
+    ],
+    "recall": 1.0,
+    "recall_ci": [
+      0.9992322980549431,
+      1.0
+    ],
+    "specificity": 1.0,
+    "specificity_ci": [
+      0.9992322980549431,
+      1.0
+    ],
+    "fpr": 0.0,
+    "fpr_ci": [
+      0.0,
+      0.0007677019450569311
+    ],
+    "f1": 1.0,
+    "mcc": 1.0
+  },
+  "challenge": {
+    "counts": {
+      "TN": 5000,
+      "FP": 0,
+      "FN": 191,
+      "TP": 4809,
+      "N": 10000
+    },
+    "accuracy": 0.9809,
+    "accuracy_ci": [
+      0.9780267698544574,
+      0.9834039005126258
+    ],
+    "precision": 1.0,
+    "precision_ci": [
+      0.9992018314225468,
+      1.0
+    ],
+    "recall": 0.9618,
+    "recall_ci": [
+      0.9561227277633483,
+      0.9667682227201971
+    ],
+    "specificity": 1.0,
+    "specificity_ci": [
+      0.9992322980549431,
+      1.0
+    ],
+    "fpr": 0.0,
+    "fpr_ci": [
+      0.0,
+      0.0007677019450569311
+    ],
+    "f1": 0.9805280864512183,
+    "mcc": 0.9625025174657538
+  },
+  "families": {
+    "Multilingual instructions": {
+      "missed": 148,
+      "recall": 0.7636,
+      "n_consistent": [
+        626,
+        626
+      ],
+      "n": 626,
+      "recall_ci": [
+        0.7287497393013505,
+        0.7951916357518054
+      ]
+    },
+    "Dependency traps": {
+      "missed": 37,
+      "recall": 0.9391,
+      "n_consistent": [
+        608,
+        608
+      ],
+      "n": 608,
+      "recall_ci": [
+        0.9172451603292725,
+        0.9555299553506439
+      ]
+    },
+    "Unicode spoofing": {
+      "missed": 6,
+      "recall": 0.9905,
+      "n_consistent": [
+        629,
+        634
+      ]
+    },
+    "Indirect completion": {
+      "missed": 0,
+      "recall": 1.0,
+      "n_consistent": null
+    },
+    "Reasoning lures": {
+      "missed": 0,
+      "recall": 1.0,
+      "n_consistent": null
+    },
+    "Polite requests": {
+      "missed": 0,
+      "recall": 1.0,
+      "n_consistent": null
+    },
+    "Few-shot imitation": {
+      "missed": 0,
+      "recall": 1.0,
+      "n_consistent": null
+    },
+    "Encoded instructions": {
+      "missed": 0,
+      "recall": 1.0,
+      "n_consistent": null
+    }
+  },
+  "miss_share": {
+    "Multilingual instructions": 0.774869109947644,
+    "Dependency traps": 0.193717277486911,
+    "Unicode spoofing": 0.031413612565445025
+  },
+  "recall_without_multilingual": 0.9901691815272062,
+  "recall_without_multilingual_and_dependency": 0.9984067976633032
+}
