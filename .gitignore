@@ -1,16 +1,17 @@
-# environments & secrets
-.venv/
+# environments and secrets
+.venv
 .env
 # python
 __pycache__/
 *.pyc
-.pytest_cache/
-# generated data, models, results (re-created by the pipeline)
-data/raw/*
-data/processed/*
-data/processed_smoke/
-models/*
-results/*
-!**/.gitkeep
-# packaging
-*.zip
+# generated at runtime (rebuilt by the scripts)
+data/chroma/
+data/demo_history.json
+data/*.tmp
+data/external_dataset.csv
+models/layer1_detector/
+models/layer1_detector_new/
+models/embedding_cache/
+results/*.json
+results/*.png
+dist/

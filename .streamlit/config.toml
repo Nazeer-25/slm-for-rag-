@@ -1,0 +1,11 @@
+# Same look as the website: forest green and ivory, serif text.
+[theme]
+base = "light"
+primaryColor = "#1f4d3a"
+backgroundColor = "#fbf8ef"
+secondaryBackgroundColor = "#f3eedf"
+textColor = "#1f2a24"
+font = "serif"
+
+[browser]
+gatherUsageStats = false

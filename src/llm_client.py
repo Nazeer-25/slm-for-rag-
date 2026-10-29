@@ -1,193 +1,156 @@
-"""Provider-agnostic chat client (OpenAI / Ollama / offline mock) with token
-accounting, cost estimation and an on-disk response cache.
+"""Generation backends. Default: a local Ollama model (no API key, no charges).
 
-Ollama exposes an OpenAI-compatible endpoint at http://localhost:11434/v1, so a
-single code path serves both providers. The defense never needs model internals:
-this client is the only interface to the main LLM (black-box assumption).
+Optional remote provider: set LLM_PROVIDER=openai and OPENAI_API_KEY (and optionally
+OPENAI_MODEL). That provider may incur API charges.
+
+The defense treats the model as a black box: these classes are its only interface.
 """
 from __future__ import annotations
 
-import functools
-import hashlib
 import json
 import os
-import re
-import sqlite3
-import threading
+import socket
 import time
-from dataclasses import dataclass, field
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 
-from src.utils import get_logger
+import config
 
-log = get_logger("llm_client")
+
+class LLMError(RuntimeError):
+    """A generation request failed (server unreachable, model missing, timeout, ...)."""
 
 
 @dataclass
-class LLMResponse:
+class LLMReply:
     text: str
+    latency_ms: float
     prompt_tokens: int
     completion_tokens: int
-    latency_ms: float
-    cost_usd: float
-    cached: bool = False
-    model: str = ""
+    model: str
+    provider: str
 
 
-@dataclass
-class UsageMeter:
-    calls: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    cost_usd: float = 0.0
-    latency_ms: float = 0.0
-    by_tag: dict = field(default_factory=dict)
+class OllamaClient:
+    provider = "ollama"
 
-    def add(self, r: LLMResponse, tag: str = "generation") -> None:
-        self.calls += 1
-        self.prompt_tokens += r.prompt_tokens
-        self.completion_tokens += r.completion_tokens
-        self.cost_usd += r.cost_usd
-        self.latency_ms += r.latency_ms
-        t = self.by_tag.setdefault(tag, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0})
-        t["calls"] += 1
-        t["prompt_tokens"] += r.prompt_tokens
-        t["completion_tokens"] += r.completion_tokens
-        t["cost_usd"] += r.cost_usd
+    def __init__(self, host: str = config.OLLAMA_HOST, model: str = config.OLLAMA_MODEL,
+                 timeout: float = config.LLM_TIMEOUT_S, max_tokens: int = config.LLM_MAX_TOKENS):
+        self.host = host.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+        self.max_tokens = max_tokens
+        # Never route localhost traffic through a system or corporate proxy.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+    @property
+    def label(self) -> str:
+        return f"{self.model} via Ollama"
 
-class _Cache:
-    def __init__(self, path: str):
-        self._lock = threading.Lock()
-        self._db = sqlite3.connect(path, check_same_thread=False)
-        self._db.execute("CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, v TEXT)")
+    def _request(self, path: str, payload: dict | None = None, timeout: float | None = None) -> dict:
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(self.host + path, data=data, method="GET" if data is None else "POST",
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with self._opener.open(request, timeout=timeout or self.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            try:
+                message = json.loads(body).get("error", body)
+            except ValueError:
+                message = body
+            if exc.code == 404 and "not found" in message.lower():
+                raise LLMError(f"Ollama does not have the model '{self.model}'. Run: ollama pull {self.model}") from exc
+            raise LLMError(f"Ollama returned HTTP {exc.code}: {message[:300]}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise LLMError(f"Ollama did not answer within {timeout or self.timeout:.0f} s "
+                           "(the first load of a model can be slow; try again).") from exc
+        except (urllib.error.URLError, ConnectionError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                raise LLMError(f"Ollama did not answer within {timeout or self.timeout:.0f} s "
+                               "(the first load of a model can be slow; try again).") from exc
+            raise LLMError(f"Cannot reach Ollama at {self.host} ({reason}). Open the Ollama app, or run "
+                           f"'ollama serve', then check with: ollama run {self.model} \"Reply with READY.\"") from exc
 
-    def get(self, key: str) -> dict | None:
-        with self._lock:
-            row = self._db.execute("SELECT v FROM cache WHERE k=?", (key,)).fetchone()
-        return json.loads(row[0]) if row else None
-
-    def put(self, key: str, value: dict) -> None:
-        with self._lock:
-            self._db.execute("INSERT OR REPLACE INTO cache VALUES (?, ?)", (key, json.dumps(value)))
-            self._db.commit()
-
-
-@functools.lru_cache(maxsize=1)
-def _encoder():
-    """Load tiktoken once; None if unavailable (it downloads its BPE file on first use)."""
-    try:
-        import tiktoken
-
-        return tiktoken.get_encoding("o200k_base")
-    except Exception:  # noqa: BLE001
-        log.warning("tiktoken encoding unavailable — approximating tokens as len(text)/4")
-        return None
-
-
-def _approx_tokens(text: str) -> int:
-    enc = _encoder()
-    return len(enc.encode(text)) if enc else max(1, len(text) // 4)
-
-
-class LLMClient:
-    def __init__(self, cfg: dict, provider: str | None = None, model: str | None = None):
-        lcfg = cfg["llm"]
-        self.provider = provider or os.environ.get("IPI_LLM_PROVIDER") or lcfg["provider"]
-        self.temperature = lcfg["temperature"]
-        self.max_tokens = lcfg["max_tokens"]
-        self.pricing = lcfg["pricing"]
-        self.cache = _Cache(cfg["paths"]["cache_db"]) if lcfg.get("use_cache", True) else None
-        if self.provider == "openai":
-            from openai import OpenAI
-
-            if not os.environ.get("OPENAI_API_KEY"):
-                raise RuntimeError("OPENAI_API_KEY is not set (put it in .env or export it)")
-            self.model = model or lcfg["openai_model"]
-            self._client = OpenAI(timeout=lcfg["timeout_s"], max_retries=3)
-        elif self.provider == "ollama":
-            from openai import OpenAI
-
-            self.model = model or os.environ.get("OLLAMA_MODEL") or lcfg["ollama_model"]
-            base = os.environ.get("OLLAMA_BASE_URL") or lcfg["ollama_base_url"]
-            self._client = OpenAI(base_url=base, api_key="ollama", timeout=lcfg["timeout_s"] * 5, max_retries=2)
-        elif self.provider == "mock":
-            self.model = "mock-vulnerable-llm"
-            self._client = None
-        else:
-            raise ValueError(f"unknown provider {self.provider!r}")
-
-    def _price(self, pt: int, ct: int) -> float:
-        if self.provider != "openai":
-            return 0.0
-        p = self.pricing.get(self.model, self.pricing["default"])
-        return (pt * p["input"] + ct * p["output"]) / 1_000_000
-
-    def chat(self, messages: list[dict], max_tokens: int | None = None, temperature: float | None = None) -> LLMResponse:
-        max_tokens = max_tokens or self.max_tokens
-        temperature = self.temperature if temperature is None else temperature
-        key = hashlib.sha256(json.dumps([self.provider, self.model, messages, max_tokens, temperature]).encode()).hexdigest()
-        if self.cache and (hit := self.cache.get(key)):
-            # Replay the original token counts, cost and latency so metrics are
-            # identical across re-runs (the `cached` flag marks the replay).
-            return LLMResponse(**hit, cached=True)
+    def chat(self, messages: list[dict], max_tokens: int | None = None) -> LLMReply:
+        payload = {"model": self.model, "messages": messages, "stream": False, "keep_alive": "30m",
+                   "options": {"temperature": config.LLM_TEMPERATURE, "seed": config.LLM_SEED,
+                               "num_predict": max_tokens or self.max_tokens}}
         start = time.perf_counter()
-        if self.provider == "mock":
-            text = _mock_generate(messages)
-            pt = sum(_approx_tokens(m["content"]) for m in messages)
-            ct = _approx_tokens(text)
-        else:
-            resp = self._client.chat.completions.create(model=self.model, messages=messages,
-                                                        temperature=temperature, max_tokens=max_tokens)
-            text = resp.choices[0].message.content or ""
-            if resp.usage:
-                pt, ct = resp.usage.prompt_tokens, resp.usage.completion_tokens
-            else:
-                pt = sum(_approx_tokens(m["content"]) for m in messages)
-                ct = _approx_tokens(text)
+        data = self._request("/api/chat", payload)
         latency = (time.perf_counter() - start) * 1000
-        out = LLMResponse(text=text, prompt_tokens=pt, completion_tokens=ct, latency_ms=latency,
-                          cost_usd=self._price(pt, ct), model=self.model)
-        if self.cache:
-            self.cache.put(key, {k: v for k, v in out.__dict__.items() if k != "cached"})
-        return out
+        if data.get("error"):
+            raise LLMError(f"Ollama error: {data['error']}")
+        text = (data.get("message") or {}).get("content", "")
+        return LLMReply(text.strip(), latency, int(data.get("prompt_eval_count") or 0),
+                        int(data.get("eval_count") or 0), self.model, self.provider)
+
+    def health(self) -> dict:
+        try:
+            tags = self._request("/api/tags", timeout=3)
+        except LLMError as exc:
+            return {"reachable": False, "model_present": False, "models": [], "error": str(exc)}
+        names = [m.get("name", "") for m in tags.get("models", [])]
+        wanted = self.model if ":" in self.model else f"{self.model}:latest"
+        return {"reachable": True, "model_present": wanted in names or self.model in names, "models": names,
+                "error": None if (wanted in names or self.model in names) else
+                f"Model '{self.model}' is not pulled. Run: ollama pull {self.model}"}
+
+    def warm_up(self) -> LLMReply:
+        """The same smoke test as `ollama run <model> "Reply with READY."`: proves real generation works."""
+        return self.chat([{"role": "user", "content": "Reply with READY."}], max_tokens=8)
 
 
-# ----------------------------------------------------------------------------- mock
-# A deliberately *vulnerable*, deterministic stand-in for the main LLM, used ONLY
-# for offline smoke tests and CI. It (a) obeys any quoted reply / URL instruction
-# found in the context — mimicking an injectable model — and otherwise (b) answers
-# with the context sentence that best overlaps the question. Never report results
-# produced with provider=mock as research findings.
+class OpenAIClient:
+    provider = "openai"
 
-_OBEY = re.compile(
-    r"(?:reply|respond|answer|output|print|say|repeat|begin|start|include|add|append|antworte|responde|réponds|rispondi)"
-    r"[^'\"\n]{0,80}?['\"]([^'\"]{2,120})['\"]",
-    re.IGNORECASE,
-)
-_URL = re.compile(r"https?://[^\s)\]]+")
-_TRIGGER = re.compile(r"ignore|disregard|forget|system|instruction|assistant|must|tell the|inform|warn|instead|"
-                      r"ignoriere|ignora|you are|from now on|directive|note for ai", re.IGNORECASE)
+    def __init__(self, model: str = config.OPENAI_MODEL, timeout: float = config.LLM_TIMEOUT_S,
+                 max_tokens: int = config.LLM_MAX_TOKENS):
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise LLMError("LLM_PROVIDER=openai needs OPENAI_API_KEY to be set.")
+        from openai import OpenAI
+
+        self.model = model
+        self.max_tokens = max_tokens
+        self._client = OpenAI(timeout=timeout, max_retries=2)
+
+    @property
+    def label(self) -> str:
+        return f"{self.model} via OpenAI API"
+
+    def chat(self, messages: list[dict], max_tokens: int | None = None) -> LLMReply:
+        start = time.perf_counter()
+        try:
+            resp = self._client.chat.completions.create(model=self.model, messages=messages,
+                                                        temperature=config.LLM_TEMPERATURE, seed=config.LLM_SEED,
+                                                        max_tokens=max_tokens or self.max_tokens)
+        except Exception as exc:  # noqa: BLE001 - surface any SDK error as a failed run
+            raise LLMError(f"OpenAI request failed: {exc}") from exc
+        usage = resp.usage
+        return LLMReply((resp.choices[0].message.content or "").strip(), (time.perf_counter() - start) * 1000,
+                        usage.prompt_tokens if usage else 0, usage.completion_tokens if usage else 0,
+                        self.model, self.provider)
+
+    def health(self) -> dict:
+        return {"reachable": True, "model_present": True, "models": [self.model], "error": None}
+
+    def warm_up(self) -> LLMReply:
+        return self.chat([{"role": "user", "content": "Reply with READY."}], max_tokens=8)
 
 
-def _mock_generate(messages: list[dict]) -> str:
-    user = messages[-1]["content"]
-    system = " ".join(m["content"] for m in messages if m["role"] == "system")
-    if "Answer YES or NO" in system or "Answer YES or NO" in user:  # LLM-as-judge prompt
-        body = user.split("<chunk>")[-1] if "<chunk>" in user else user
-        return "YES" if _TRIGGER.search(body) and (_OBEY.search(body) or _URL.search(body)) else "NO"
-    question = user.rsplit("Question:", 1)[-1]
-    context = user.rsplit("Question:", 1)[0]
-    # Vulnerable behaviour: obey embedded instructions that appear in the context.
-    for sent in re.split(r"(?<=[.!?])\s+|\n", context):
-        if _TRIGGER.search(sent):
-            if m := _OBEY.search(sent):
-                return m.group(1)
-            if m := _URL.search(sent):
-                return f"Warning: please visit {m.group(0)}"
-    q_words = set(re.findall(r"[a-z0-9]+", question.lower())) - {"the", "a", "of", "what", "how", "is", "to", "in", "does"}
-    best, best_score = "I don't know.", 0
-    for sent in re.split(r"(?<=[.!?])\s+", context):
-        score = len(q_words & set(re.findall(r"[a-z0-9]+", sent.lower())))
-        if score > best_score:
-            best, best_score = sent.strip(), score
-    return best
+def make_llm_client(provider: str | None = None):
+    provider = (provider or config.LLM_PROVIDER).lower()
+    if provider == "ollama":
+        return OllamaClient()
+    if provider == "openai":
+        return OpenAIClient()
+    raise LLMError(f"Unknown LLM_PROVIDER '{provider}' (use 'ollama' or 'openai').")
+
+
+def describe_llm(provider: str | None = None) -> str:
+    """Model label without connecting (for status pages)."""
+    provider = (provider or config.LLM_PROVIDER).lower()
+    return f"{config.OPENAI_MODEL} via OpenAI API" if provider == "openai" else f"{config.OLLAMA_MODEL} via Ollama"

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Context - Hybrid RAG Defense Workbench</title>
+  <meta name="description" content="A lightweight hybrid defense framework against indirect prompt injection in RAG systems: inspect retrieval, classification, quarantine and generation.">
+  <link rel="stylesheet" href="static/styles.css">
+</head>
+<body>
+<div id="snapshot-banner" class="snapshot-banner" hidden></div>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="#playground">
+      <span class="brand-mark" aria-hidden="true">C</span>
+      <span><span class="brand-name">Context</span><span class="brand-sub">Hybrid RAG Defense Workbench</span></span>
+    </a>
+    <button id="status-chip" class="status-chip" type="button" title="Show workspace status">
+      <span class="dot"></span><span class="text">Checking workspace…</span>
+    </button>
+    <button id="init-btn" class="btn-init" type="button">Initialize workspace</button>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="sidenav" aria-label="Screens">
+    <a href="#playground" data-view="playground"><span class="nav-num">1</span>Live playground</a>
+    <a href="#knowledge" data-view="knowledge"><span class="nav-num">2</span>Knowledge base</a>
+    <a href="#architecture" data-view="architecture"><span class="nav-num">3</span>System architecture</a>
+    <a href="#results" data-view="results"><span class="nav-num">4</span>Results &amp; evidence</a>
+    <a href="#guide" data-view="guide"><span class="nav-num">5</span>Presentation guide</a>
+    <div class="nav-foot">A Lightweight Hybrid Defense Framework Against Indirect Prompt Injection in RAG Systems. All answers come from real model inference.</div>
+  </nav>
+
+  <main>
+    <section id="init-panel" class="card init-panel" hidden aria-live="polite"></section>
+
+    <section class="view" id="view-playground">
+      <h1>Live playground</h1>
+      <p class="lede">Ask a question, choose a defense and a corpus, and watch the request travel through retrieval, Layer 1 classification, Layer 2 quarantine and generation. Every answer comes from the real model.</p>
+      <div class="grid-2">
+        <div class="card" id="pg-controls"></div>
+        <div id="pg-result"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-knowledge" hidden>
+      <h1>Knowledge base</h1>
+      <p class="lede">Every source CSV and the live Chroma collections. Labels, clean evaluation references and attacker targets are shown here for inspection; the defense itself never reads them.</p>
+      <div id="kb"></div>
+    </section>
+
+    <section class="view" id="view-architecture" hidden>
+      <h1>System architecture</h1>
+      <p class="lede">The filter sits strictly between retrieval and generation and treats the language model as a black box.</p>
+      <div id="arch"></div>
+    </section>
+
+    <section class="view" id="view-results" hidden>
+      <h1>Results &amp; evidence</h1>
+      <p class="lede">Saved detector metrics, benchmark metrics when generated, and the actual experiments run on this website.</p>
+      <div id="results"></div>
+    </section>
+
+    <section class="view" id="view-guide" hidden>
+      <h1>Presentation guide</h1>
+      <p class="lede">Six staged demonstrations. Initialize the workspace first, then run them in order; each card says what to point at and how to read the result.</p>
+      <div id="guide"></div>
+    </section>
+  </main>
+</div>
+<script src="static/app.js"></script>
+</body>
+</html>
