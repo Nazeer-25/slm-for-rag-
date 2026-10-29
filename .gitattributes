@@ -1,5 +1,5 @@
 * text=auto
-# Windows batch files must keep CRLF line endings
-*.bat text eol=crlf
+# Windows batch files are stored byte-for-byte with CRLF line endings (also in ZIP downloads)
+*.bat -text
 *.sh text eol=lf
 *.png binary
