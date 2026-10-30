@@ -87,6 +87,7 @@ class Report:
         self.figures += 1
         par = self.doc.add_paragraph()
         par.alignment = self.ALIGN.CENTER
+        par.paragraph_format.keep_with_next = True
         par.add_run().add_picture(str(path), width=self.Cm(width_cm))
         cap = self.doc.add_paragraph()
         cap.alignment = self.ALIGN.CENTER
@@ -129,6 +130,10 @@ class Report:
                     cell._tc.get_or_add_tcPr().append(shd)
                 if widths_cm:
                     cell.width = self.Cm(widths_cm[j])
+                cell.paragraphs[0].paragraph_format.keep_with_next = i < len(rows)   # keep the table on one page
+            split = OxmlElement("w:cantSplit")
+            split.set(qn("w:val"), "true")
+            tab.rows[i]._tr.get_or_add_trPr().append(split)
         if note:
             n = self.doc.add_paragraph()
             n.add_run(note).font.size = self.Pt(8.5)
@@ -250,6 +255,40 @@ def interpret_ablation(summ, splits):
 
 
 # --------------------------------------------------------------------------- section 2: thresholds
+SUP = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def tfmt(t: float) -> str:
+    """Thresholds as written in the text: 0.1 -> 0.10, 0.125 -> 0.125, 1e-06 -> 0.000001, 0.999999."""
+    if 0 < t < 0.001 or 0.999 < t < 1:
+        return f"{t:.{-math.floor(math.log10(t if t < 0.5 else 1 - t) + 1e-9)}f}"
+    return f"{t:.2f}" if abs(t * 100 - round(t * 100)) < 1e-9 else f"{t:g}"
+
+
+def sfmt(x: float) -> str:
+    """A score with three significant digits of its distance to 0 or to 1 (0.000552, 0.175, 0.999842)."""
+    if not 0 < x < 1:
+        return f"{x:g}"
+    return f"{x:.{max(3, 2 - math.floor(math.log10(min(x, 1 - x)) + 1e-9))}f}"
+
+
+def axis_end(logodds: float) -> str:
+    t = 1 / (1 + math.exp(-logodds))
+    m, e = f"{min(t, 1 - t):.1e}".split("e")
+    sci = f"{m} × 10{str(int(e)).translate(SUP)}"
+    return sci if t < 0.5 else f"1 − {sci}"
+
+
+def margin(x) -> str:
+    return "—" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:+.2f}"
+
+
+def roles(text: str) -> str:
+    """Role column: 'requested, current, selected' -> 'current, τ*'."""
+    names = {"current": "current", "selected": "τ*", "midpoint": "midpoint"}
+    return ", ".join(names[r] for r in (x.strip() for x in text.split(",")) if r in names)
+
+
 def threshold_section(rep: Report, out: Path):
     rep.h1("2  Threshold sensitivity of the detector")
     f = out / "threshold_summary.json"
@@ -257,87 +296,235 @@ def threshold_section(rep: Report, out: Path):
         rep.para("Not run yet. Run: .venv\\Scripts\\python.exe supplementary\\threshold_sensitivity.py", italic=True)
         return
     s = json.loads(f.read_text())
-    v = s["validation"]
+    if "optimal_interval" not in s:
+        rep.para("threshold_summary.json comes from an older version of threshold_sensitivity.py; run the script again.",
+                 italic=True)
+        return
+    v, cur, req = s["validation"], s["current_threshold"], s["thresholds"]
+    if s.get("checkpoint_threshold_differs"):
+        rep.para(f"Checkpoint note: {Path(s['detector_dir']).name} stores the threshold {s['checkpoint_threshold']}, not "
+                 f"{cur:g}. Unless {cur:g} was selected for this checkpoint, this section cannot justify it. Run "
+                 "threshold_sensitivity.py --list-checkpoints and repeat the analysis with the checkpoint that selected "
+                 f"{cur:g} (--detector-dir <folder> --rescore-tests).", italic=True)
+    rep.h2("Method")
+    x_lo, x_hi = s["axis"]
+    rule = s["rule"].replace("<= limit", f"≤ {100 * s['fpr_limit']:g}%")
     rep.bullets([
-        f"Selection data: validation set only ({v['chunks']:,} chunks: {v['injected']:,} injected, {v['benign']:,} benign).",
-        "Thresholds: " + ", ".join(f"{t:g}" for t in s["thresholds"]) + ".",
-        f"Rule: {s['rule']}; constraint FPR ≤ {100 * s['fpr_limit']:g}%.",
-        "The regular and challenge test sets are used only afterwards, for the final evaluation of the selected "
-        f"threshold and the current threshold {s['current_threshold']:g} (saved per-chunk predictions from training).",
-        f"Detector: {s['detector']}. Scorer check against the saved test predictions: {s['scorer_check'].get('status')}"
-        + (f" (max |difference| {s['scorer_check']['max_abs_difference']:.1e} over {s['scorer_check']['chunks']} chunks)."
-           if "max_abs_difference" in s["scorer_check"] else "."),
+        f"Selection data: the validation set only ({v['chunks']:,} chunks: {v['injected']:,} injected, {v['benign']:,} benign; "
+        f"scores {v['source']}). The regular and challenge test sets ({s['test_scores']}) are used only afterwards.",
+        "A chunk is flagged when its score is at least τ. Recall = TP / (TP + FN); FPR = FP / (FP + TN); constraint: "
+        f"validation FPR ≤ {100 * s['fpr_limit']:g}%.",
+        f"Thresholds: the requested values {', '.join(tfmt(t) for t in req)}, and a sweep over the whole score range from "
+        f"{axis_end(x_lo)} to {axis_end(x_hi)} in steps of 0.1 on the log-odds scale ln(τ / (1 − τ)). The detector's scores "
+        "lie very close to 0 and 1, so the curves can only be seen on a log-odds axis.",
+        "Validation-optimal interval: all thresholds with the highest validation recall under the FPR constraint and, among "
+        "those, the lowest FPR. No validation score lies inside it, so every threshold in it makes the same decision on every "
+        "validation chunk. Its midpoint is the threshold farthest from the nearest benign and nearest injected score.",
+        "Margins: the distance from a threshold to the lower (benign) and upper (injected) end of the interval, in decades of "
+        "odds, i.e. log10 of the odds ratio. A margin of 2 means a factor of 100 in the odds τ / (1 − τ).",
+        f"Rule for the requested thresholds: {rule}.",
     ])
-    rows = [[f"{r['threshold']:g}" + (" (current)" if r["current"] else ""), f"{r['TP']:,}/{r['positives']:,}",
-             f"{pv(r['recall'], 2)} {ci(r['recall_lo'], r['recall_hi'], 2)}", f"{r['FP']:,}/{r['negatives']:,}",
-             f"{pv(r['fpr'], 2)} {ci(r['fpr_lo'], r['fpr_hi'], 2)}", pv(r["precision"], 2),
-             "yes" if r["feasible"] else "no", "τ*" if r["selected"] else ""] for r in s["grid"]]
-    rep.table("Validation recall and false-positive rate per threshold, in percent with 95% Wilson intervals",
-              ["τ", "TP / injected", "Recall", "FP / benign", "FPR", "Precision", "FPR ≤ 2%", "Selected"],
-              rows, [1.9, 1.9, 3.2, 1.7, 2.8, 1.8, 1.6, 1.5])
+
+    rep.h2("Validation results (used for the selection)")
+    rows = []
+    for r in s["grid"]:
+        note = ", ".join(x for x, flag in (("τ*", r["selected"]), ("current", r["current"])) if flag)
+        rows.append([tfmt(r["threshold"]), f"{r['TP']:,}", f"{r['FN']:,}", f"{r['FP']:,}", f"{r['TN']:,}", pv(r["recall"], 2),
+                     pv(r["fpr"], 2), "yes" if r["feasible"] else "no", margin(r["lower_margin"]),
+                     margin(r["upper_margin"]), note])
+    rep.table("Validation results at the requested thresholds, with the margins to both ends of the validation-optimal "
+              "interval", ["τ", "TP", "FN", "FP", "TN", "Recall (%)", "FPR (%)", "FPR ≤ 2%", "Lower margin", "Upper margin",
+                           "Note"], rows, [1.4, 1.3, 1.1, 1.1, 1.3, 1.7, 1.5, 1.4, 1.8, 1.8, 1.7],
+              note="Margins in decades of odds to the lower end (benign side) and the upper end (injected side) of the "
+                   "validation-optimal interval; a negative margin means the threshold lies outside the interval on that side.")
+    n_tab_grid = rep.tables
+    n_fig_val = None
     fig, source = pick_figure(out, "fig_threshold_sensitivity")
     if fig:
-        rep.figure(fig, f"Validation recall (top) and FPR (bottom) against the threshold. Dashed vertical line: current "
-                        f"threshold {s['current_threshold']:g}; dashed horizontal line: FPR limit 2%; ring: selected τ* "
-                        f"({source} figure).", 10.5)
-    final = s["final_evaluation"]
-    rows = [[SPLIT_LABELS[r["split"]], f"{r['threshold']:g}", r["role"], f"{pv(r['recall'], 2)} {ci(r['recall_lo'], r['recall_hi'], 2)}",
-             f"{pv(r['fpr'], 2)} {ci(r['fpr_lo'], r['fpr_hi'], 2)}", pv(r["precision"], 2), pv(r["accuracy"], 2),
-             f"{r['TN']:,} / {r['FP']:,} / {r['FN']:,} / {r['TP']:,}"] for r in final]
-    rep.table("Final evaluation on the test sets, in percent with 95% Wilson intervals (not used for selection)",
-              ["Test set", "τ", "Role", "Recall", "FPR", "Precision", "Accuracy", "TN / FP / FN / TP"], rows,
-              [1.8, 1.0, 2.0, 3.1, 2.6, 1.8, 1.8, 2.3])
+        rep.figure(fig, f"Validation recall (orange) and FPR (blue) for every threshold from {axis_end(x_lo)} to "
+                        f"{axis_end(x_hi)} on a log-odds axis (top), and the validation scores of benign (blue) and injected "
+                        "(orange) chunks on the same axis (bottom, log counts). Green: validation-optimal interval; grey: "
+                        f"requested thresholds {tfmt(min(req))}–{tfmt(max(req))} (dots); dashed: τ = {cur:g}; dotted: midpoint "
+                        f"of the interval ({source} figure).", 11.0)
+        n_fig_val = rep.figures
+    rows = [[tfmt(r["threshold"]) + (" (current)" if r["current"] else ""), f"{r['TP']:,}", f"{r['FN']:,}", f"{r['FP']:,}",
+             f"{r['TN']:,}", pv(r["recall"], 2), pv(r["fpr"], 2), "yes" if r["feasible"] else "no"] for r in s["range"]]
+    rep.table("Validation results across the whole score range", ["τ", "TP", "FN", "FP", "TN", "Recall (%)", "FPR (%)",
+                                                                   "FPR ≤ 2%"], rows, [2.8, 1.6, 1.6, 1.6, 1.6, 2.2, 2.0, 1.8])
+    n_tab_range = rep.tables
+    rep.h2("Interpretation")
+    for text in interpret_validation(s, n_tab_grid, n_tab_range, n_fig_val):
+        rep.para(text)
+
+    rep.h2("Final evaluation on the test sets (not used for the selection)")
+    fe = s["final_evaluation"]
+    by = {(r["split"], r["threshold"]): r for r in fe}
+    rows = []
+    for t in sorted({r["threshold"] for r in fe}):
+        a, b = by[("regular", t)], by[("challenge", t)]
+        rows.append([tfmt(t) if "requested" in a["role"] or "current" in a["role"] else sfmt(t), roles(a["role"]),
+                     f"{a['FN']:,} / {a['FP']:,}", pv(a["recall"], 2), f"{b['FN']:,} / {b['FP']:,}",
+                     f"{pv(b['recall'], 2)} {ci(b['recall_lo'], b['recall_hi'], 2)}", pv(b["fpr"], 2)])
+    rep.table("Test-set results at the same thresholds (evaluation only)",
+              ["τ", "Role", "Regular FN / FP", "Regular recall (%)", "Challenge FN / FP", "Challenge recall (%) [95% CI]",
+               "Challenge FPR (%)"], rows, [1.6, 2.4, 2.2, 2.0, 2.2, 3.8, 2.0])
+    fig, source = pick_figure(out, "fig_threshold_evaluation")
+    if fig:
+        rep.figure(fig, "Recall (top, zoomed) and FPR (bottom) on the regular test (blue) and the challenge set (orange) over "
+                        f"the same threshold range. Evaluation only: these sets were not used to choose τ. Shading and lines "
+                        f"as in Figure {n_fig_val} ({source} figure).", 11.0)
     fam = s.get("family_recall") or []
     if fam:
         ts = sorted({r["threshold"] for r in fam})
         names = sorted({r["family"] for r in fam})
-        by = {(r["family"], r["threshold"]): r for r in fam}
-        rows = [[n, str(by[(n, ts[0])]["n"]), *[f"{p(by[(n, t)]['recall'], 2)} ({by[(n, t)]['missed']} missed)" for t in ts]]
-                for n in names]
-        rep.table("Challenge recall per withheld attack family", ["Family", "n", *[f"τ = {t:g}" for t in ts]], rows,
-                  [4.4, 1.4, *[round(10.6 / len(ts), 2)] * len(ts)])
+        byf = {(r["family"], r["threshold"]): r for r in fam}
+        heads = [tfmt(t) if "requested" in byf[(names[0], t)]["role"] or "current" in byf[(names[0], t)]["role"]
+                 else f"{sfmt(t)} (mid.)" for t in ts]
+        rows = [[n.replace("_", " "), f"{byf[(n, ts[0])]['n']:,}", *[f"{byf[(n, t)]['missed']:,}" for t in ts]] for n in names]
+        rows.append(["All withheld families", f"{sum(byf[(n, ts[0])]['n'] for n in names):,}",
+                     *[f"{sum(byf[(n, t)]['missed'] for n in names):,}" for t in ts]])
+        rep.table("Missed challenge injections per withheld attack family at each threshold (evaluation only)",
+                  ["Family", "n", *heads], rows, [3.4, 1.2, *[round(11.6 / len(ts), 2)] * len(ts)])
     rep.h2("Interpretation")
-    for text in interpret_threshold(s):
+    for text in interpret_evaluation(s):
+        rep.para(text)
+
+    rep.h2("How the threshold can be described in the paper")
+    for text in suggested_wording(s, n_tab_grid, n_tab_range):
         rep.para(text)
 
 
-def interpret_threshold(s):
-    grid, cur, tau = s["grid"], s["current_threshold"], s["selected_threshold"]
-    rec = [r["recall"] for r in grid]
-    fpr = [r["fpr"] for r in grid]
-    n_feas = len(s["feasible_thresholds"])
-    def span(values, name):
-        lo, hi = min(values), max(values)
-        return (f"{name} was {p(lo, 2)} at every threshold" if abs(hi - lo) < 1e-12
-                else f"{name} ranged from {p(lo, 2)} to {p(hi, 2)}")
-    out = [f"On the validation set, {span(rec, 'recall')} and {span(fpr, 'the FPR')}; {n_feas} of {len(grid)} "
-           f"thresholds satisfy FPR ≤ {100 * s['fpr_limit']:g}%."]
+def interpret_validation(s, n_tab_grid, n_tab_range, n_fig):
+    v, band, cur, c = s["validation"], s["optimal_interval"], s["current_threshold"], s["current"]
+    req = [r for r in s["grid"] if r["requested"]]
+    first, low_t, high_t = req[0], tfmt(req[0]["threshold"]), tfmt(req[-1]["threshold"])
+    fig = f"Figure {n_fig}" if n_fig else "the full-range sweep"
+    out = []
+    if all(r["TP"] == first["TP"] and r["FP"] == first["FP"] for r in req):
+        out.append(f"Between {low_t} and {high_t} the validation results do not change (Table {n_tab_grid}): every requested "
+                   f"threshold flags {first['TP']:,} of {first['positives']:,} injected and {first['FP']:,} of "
+                   f"{first['negatives']:,} benign chunks (recall {p(first['recall'], 2)}, FPR {p(first['fpr'], 2)}). This is "
+                   f"not a plotting error. No validation chunk has a score between {low_t} and {high_t}, so moving the threshold "
+                   "within this range cannot change any decision; a flat line is the correct result for this range.")
+    else:
+        rec, fpr = [r["recall"] for r in req], [r["fpr"] for r in req]
+        out.append(f"Across the requested thresholds, validation recall ranges from {p(min(rec), 2)} to {p(max(rec), 2)} and "
+                   f"the FPR from {p(min(fpr), 2)} to {p(max(fpr), 2)} (Table {n_tab_grid}); "
+                   f"{sum(r['feasible'] for r in req)} of {len(req)} thresholds satisfy FPR ≤ {100 * s['fpr_limit']:g}%.")
+    rng = s["range"]
+    if band and band["separable"]:
+        text = (f"Recall and FPR change only outside this range ({fig}). The highest score of a benign validation chunk "
+                f"is {sfmt(v['benign_max'])} and the lowest score of an injected one {sfmt(v['injected_min'])}: the FPR rises "
+                "only for thresholds below the first value, and recall falls only for thresholds above the second.")
+    else:
+        text = (f"Over the whole score range ({fig}) the two classes overlap: benign scores reach {sfmt(v['benign_max'])} and "
+                f"injected scores go down to {sfmt(v['injected_min'])}.")
+    text += (f" At τ = {tfmt(rng[0]['threshold'])}, {p(rng[0]['fpr'], 1)} of the benign chunks are flagged; at τ = "
+             f"{tfmt(rng[-1]['threshold'])}, recall is {p(rng[-1]['recall'], 1)} (Table {n_tab_range}).")
+    if band and band.get("fpr_edge") is not None:
+        text += f" The {100 * s['fpr_limit']:g}% FPR limit is exceeded only for τ ≤ {sfmt(band['fpr_edge'])}."
+    out.append(text)
+    if band:
+        text = (f"The validation-optimal interval is ({sfmt(band['lo'])}, {sfmt(band['hi'])}]: every threshold in it gives "
+                f"recall {p(band['recall'], 2)} and FPR {p(band['fpr'], 2)} on validation. It is "
+                f"{band['width_decades']:.1f} decades of odds wide, and its midpoint is {sfmt(band['midpoint'])}.")
+        if c["in_optimal_interval"]:
+            text += (f" The current threshold {cur:g} lies inside the interval, {c['lower_margin']:.1f} decades of odds above "
+                     f"its lower end and {c['upper_margin']:.1f} below its upper end. On validation it is therefore an optimal "
+                     "threshold, but not the only one: every threshold in the interval performs identically. The margins "
+                     f"measure its robustness: a benign chunk would need {c['lower_margin']:.1f} decades higher odds than the "
+                     f"most suspicious benign validation chunk to be flagged, and an injected chunk {c['upper_margin']:.1f} "
+                     "decades lower odds than the least suspicious injected one to be missed.")
+            if abs(c["upper_margin"] - c["lower_margin"]) >= 0.5:
+                side = "injected" if c["upper_margin"] > c["lower_margin"] else "benign"
+                text += f" The threshold therefore leaves more room on the {side} side."
+        else:
+            text += (f" The current threshold {cur:g} lies outside the interval: on validation it gives recall "
+                     f"{p(c['recall'], 2)} and FPR {p(c['fpr'], 2)}.")
+        out.append(text)
+    tau, tied = s["selected_threshold"], s["tied_thresholds"]
     if tau is None:
-        out.append("No threshold in the grid meets the FPR constraint on validation, so none is selected.")
-        return out
-    r_tau = next(r for r in grid if r["threshold"] == tau)
-    r_cur = next(r for r in grid if abs(r["threshold"] - cur) < 1e-9)
-    tied = [r["threshold"] for r in grid if r["TP"] == r_tau["TP"] and r["FP"] == r_tau["FP"]]
-    if abs(tau - cur) < 1e-9:
-        text = f"The rule selects τ* = {tau:g}, which is the current threshold, so the independent sweep confirms the operating point."
-        if len(tied) > 1:
-            text += (f" Thresholds from {min(tied):g} to {max(tied):g} give identical validation recall and FPR "
-                     f"({p(r_tau['recall'], 2)} and {p(r_tau['fpr'], 2)}); {tau:g} lies at the centre of this plateau, which "
-                     "leaves the largest margin on both sides.")
+        out.append(f"None of the requested thresholds meets FPR ≤ {100 * s['fpr_limit']:g}% on validation.")
+    elif len(tied) > 1:
+        text = (f"{len(tied)} of the {len(req)} requested thresholds tie on validation; the rule picks the one closest to the "
+                f"midpoint of the interval, τ* = {tfmt(tau)}.")
+        if abs(tau - cur) < 1e-9:
+            text += f" This is the current threshold {cur:g}."
+        elif any(abs(t - cur) < 1e-9 for t in tied):
+            text += (f" The current threshold {cur:g} gives identical validation results, so the validation data do not prefer "
+                     "either value: the difference between them is a tie-break, not a difference in performance.")
         out.append(text)
     else:
-        out.append(f"The rule selects τ* = {tau:g} instead of {cur:g}: validation recall {p(r_tau['recall'], 2)} vs "
-                   f"{p(r_cur['recall'], 2)} and FPR {p(r_tau['fpr'], 2)} vs {p(r_cur['fpr'], 2)}.")
-    fe = {(r["split"], r["threshold"]): r for r in s["final_evaluation"]}
-    parts = []
+        r_tau = next(r for r in s["grid"] if r["threshold"] == tau)
+        r_cur = next(r for r in s["grid"] if r["current"])
+        out.append(f"The rule selects τ* = {tfmt(tau)}, with validation recall {p(r_tau['recall'], 2)} and FPR "
+                   f"{p(r_tau['fpr'], 2)}" + ("." if abs(tau - cur) < 1e-9 else
+                                             f" (current threshold {cur:g}: {p(r_cur['recall'], 2)} and {p(r_cur['fpr'], 2)})."))
+    return out
+
+
+def interpret_evaluation(s):
+    fe, cur = s["final_evaluation"], s["current_threshold"]
+    out = []
     for split in ("regular", "challenge"):
-        a, b = fe.get((split, tau)), fe.get((split, cur))
-        if a and b and abs(tau - cur) > 1e-9:
-            parts.append(f"on the {SPLIT_LABELS[split].lower()} set τ* gives recall {p(a['recall'], 2)} and FPR {p(a['fpr'], 2)} "
-                         f"(0.175: {p(b['recall'], 2)} and {p(b['fpr'], 2)})")
-        elif b:
-            parts.append(f"on the {SPLIT_LABELS[split].lower()} set recall is {p(b['recall'], 2)} and FPR {p(b['fpr'], 2)}")
-    out.append("In the final evaluation, " + "; ".join(parts) + ". These test numbers were not used to choose the threshold.")
+        rows = [r for r in fe if r["split"] == split and "requested" in r["role"]]
+        a, b = rows[0], rows[-1]
+        if all(r["FN"] == a["FN"] and r["FP"] == a["FP"] for r in rows):
+            text = (f"{SPLIT_LABELS[split]}: every requested threshold gives {a['FN']:,} missed injections and {a['FP']:,} false "
+                    f"alarms (recall {p(a['recall'], 2)}, FPR {p(a['fpr'], 2)}).")
+        else:
+            text = (f"{SPLIT_LABELS[split]}: here the requested thresholds are not equivalent. Missed injections go from "
+                    f"{a['FN']:,} at τ = {tfmt(a['threshold'])} to {b['FN']:,} at τ = {tfmt(b['threshold'])}, and false alarms "
+                    f"from {a['FP']:,} to {b['FP']:,}.")
+            r_cur = next((r for r in fe if r["split"] == split and "current" in r["role"]), None)
+            if r_cur:
+                text += (f" At {cur:g}: {r_cur['FN']:,} missed and {r_cur['FP']:,} false alarms (recall "
+                         f"{p(r_cur['recall'], 2)}, FPR {p(r_cur['fpr'], 2)}).")
+        r_mid = next((r for r in fe if r["split"] == split and "midpoint" in r["role"] and "current" not in r["role"]), None)
+        if r_mid:
+            text += f" At the midpoint of the validation interval ({sfmt(r_mid['threshold'])}): {r_mid['FN']:,} missed and " \
+                    f"{r_mid['FP']:,} false alarms."
+        out.append(text)
+    out.append("These test-set numbers were examined only after the selection and were not used to choose the threshold. The "
+               "challenge set contains attack families that are absent from training and validation, so it shows how the "
+               "threshold behaves under a shift that the validation set cannot reveal. Moving τ because of these numbers would "
+               "tune it on test data; a threshold chosen for unseen families needs a validation set that contains such families.")
+    return out
+
+
+def suggested_wording(s, n_tab_grid, n_tab_range):
+    v, band, cur, c = s["validation"], s["optimal_interval"], s["current_threshold"], s["current"]
+    if not band:
+        return ["No threshold meets the FPR constraint on validation, so the threshold cannot be justified from validation."]
+    if not c["in_optimal_interval"]:
+        out = [f"{cur:g} lies outside the validation-optimal interval for this checkpoint, so it cannot be described as the "
+               f"validation-selected threshold. Report the selected value (τ* = {tfmt(s['selected_threshold'])} among the "
+               f"requested thresholds; midpoint of the interval {sfmt(band['midpoint'])}) or state why {cur:g} is kept."]
+    else:
+        low_ref = "the highest benign score" if band["separable"] else "the lower end of this interval"
+        high_ref = "the lowest injected score" if band["separable"] else "its upper end"
+        text = ("Suggested text: \"The detection threshold was chosen on the validation set under the constraint FPR ≤ "
+                f"{100 * s['fpr_limit']:g}%. ")
+        if band["separable"]:
+            text += (f"On validation the detector separates the two classes completely: every benign chunk scores at most "
+                     f"{sfmt(v['benign_max'])} and every injected chunk at least {sfmt(v['injected_min'])}, so every threshold "
+                     f"in ({sfmt(band['lo'])}, {sfmt(band['hi'])}] attains {p(band['recall'], 0)} recall at "
+                     f"{p(band['fpr'], 0)} FPR (Fig. X). ")
+        else:
+            text += (f"Every threshold in ({sfmt(band['lo'])}, {sfmt(band['hi'])}] attains the highest validation recall "
+                     f"({p(band['recall'], 2)}) at the lowest admissible FPR ({p(band['fpr'], 2)}) (Fig. X). ")
+        text += (f"We use τ = {cur:g}, which lies inside this interval, {c['lower_margin']:.1f} decades of odds above {low_ref} "
+                 f"and {c['upper_margin']:.1f} decades below {high_ref}. Because all thresholds in the interval perform "
+                 "identically on validation, the validation data confirm this choice but do not single it out")
+        if c["upper_margin"] > c["lower_margin"]:
+            text += ("; we keep τ on the benign side of the interval because, in the hybrid design, a false positive only sends "
+                     "a benign chunk through the sanitizer, whereas a false negative lets an injection through unchanged")
+        text += ".\""
+        out = [text, "Replace Fig. X with the number of the threshold figure in the paper. The numbers in the text come from "
+                     f"Tables {n_tab_grid} and {n_tab_range} and the interpretation above."]
+    if s.get("checkpoint_threshold_differs"):
+        out.append("Use this text only after repeating the analysis with the checkpoint that selected the threshold (see the "
+                   "note at the start of this section); the numbers above belong to the checkpoint analysed here.")
     return out
 
 
@@ -387,13 +574,11 @@ def interpret_distributions(s):
         text += (f" The median benign score is {b['median']:.4f} and the median injected score {i['median']:.4f} "
                  f"(ROC AUC {info['roc_auc']:.4f}).")
         if info["misses"]:
+            k, b = info["misses_between_0.10_and_threshold"], info["benign_between_0.10_and_threshold"]
             text += (f" The {info['misses']:,} missed injections have a median score of {info['median_score_of_misses']:.4f} "
-                     f"(highest {info['max_score_of_misses']:.4f}); {info['misses_between_0.10_and_threshold']:,} of them lie "
-                     f"between 0.10 and τ, where {info['benign_between_0.10_and_threshold']:,} benign chunks also lie. "
-                     + ("Most misses are therefore confident errors far below the threshold rather than borderline cases, "
-                        "so moving the threshold within the tested range would recover few of them."
-                        if info["misses_between_0.10_and_threshold"] < 0.5 * info["misses"] else
-                        "Many misses are borderline, so the threshold choice matters for this set."))
+                     f"(highest {info['max_score_of_misses']:.4f}); {k:,} of them lie between 0.10 and τ, so on this set a "
+                     f"threshold of 0.10 would catch {k:,} of the {info['misses']:,} misses and flag {b:,} more benign chunks "
+                     "(Section 2 gives the counts for every threshold).")
         out.append(text)
     out.append("This description uses the test sets; the threshold itself is chosen on the validation set (Section 2).")
     return out

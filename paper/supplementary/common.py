@@ -164,7 +164,7 @@ def fmt(v):
     if isinstance(v, bool):
         return int(v)
     if isinstance(v, float):
-        return "" if math.isnan(v) else f"{v:.6g}"
+        return "" if math.isnan(v) else f"{v:.12g}"      # 12 digits keep scores like 0.99999994 apart from 1
     return v
 
 
